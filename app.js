@@ -327,6 +327,26 @@ class DanfossAllyApp extends Homey.App {
   }
 
   /**
+   * Apply a manual temperature override for a device.
+   * @param {string} deviceId - Device ID
+   * @param {number} temperature - Temperature in tenths of a degree
+   */
+  async setManualTemperature(deviceId, temperature) {
+    this._lastWriteTime = Date.now();
+
+    try {
+      const success = await this.api.setManualTemperature(deviceId, temperature);
+      if (success) {
+        this.log(`Set ${deviceId} to manual at ${temperature / 10}`);
+      }
+      return success;
+    } catch (err) {
+      this.error(`Failed to set manual temperature for ${deviceId}:`, err.message);
+      throw err;
+    }
+  }
+
+  /**
    * Set mode for a device (called by device instances)
    * @param {string} deviceId - Device ID
    * @param {string} mode - Operating mode

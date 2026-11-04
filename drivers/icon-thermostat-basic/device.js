@@ -284,22 +284,24 @@ class IconThermostatBasicDevice extends Homey.Device {
    */
   async _setTargetTemperature(temperature) {
     const app = this.homey.app;
-    const deviceData = app.getDeviceData(this._deviceId);
-
-    let setpointCode = 'manual_mode_fast';
-
-    if (this._fallbackToTempSet) {
-      setpointCode = 'temp_set';
-    } else if (deviceData && 'mode' in deviceData) {
-      setpointCode = this._getSetpointCode(deviceData.mode);
-    }
-
-    // Icon devices may need temperature in tenths or direct value - try tenths first
+    const deviceData = app.getDeviceData(this._deviceId) || {};
     const tempInTenths = Math.round(temperature * 10);
 
     try {
+      // A temperature set from Homey is a manual override. Writing the
+      // current mode's preset instead would quietly rewrite the user's
+      // schedule, so switch the device to manual and set it there.
+      if (!this._fallbackToTempSet && 'manual_mode_fast' in deviceData) {
+        await app.setManualTemperature(this._deviceId, tempInTenths);
+        this.log(`Set temperature to ${temperature}°C as a manual override`);
+        return;
+      }
+
+      const setpointCode = this._fallbackToTempSet
+        ? 'temp_set'
+        : this._getSetpointCode(deviceData.mode);
       await app.setTemperature(this._deviceId, tempInTenths, setpointCode);
-      this.log(`Set temperature to ${temperature}°C (${tempInTenths} tenths, ${setpointCode})`);
+      this.log(`Set temperature to ${temperature}°C (${setpointCode})`);
     } catch (err) {
       this.error('Failed to set temperature:', err.message);
       throw err;
