@@ -376,7 +376,8 @@
         "target_temperature",
         "measure_temperature",
         "measure_temperature.floor",
-        "measure_battery"
+        "measure_battery",
+        "danfoss_mode"
       ],
       "capabilitiesOptions": {
         "target_temperature": {
@@ -430,7 +431,8 @@
       "capabilities": [
         "target_temperature",
         "measure_temperature",
-        "measure_battery"
+        "measure_battery",
+        "danfoss_mode"
       ],
       "capabilitiesOptions": {
         "target_temperature": {
@@ -520,7 +522,8 @@
       "capabilities": [
         "target_temperature",
         "measure_temperature",
-        "measure_battery"
+        "measure_battery",
+        "danfoss_mode"
       ],
       "capabilitiesOptions": {
         "target_temperature": {
@@ -561,5 +564,17 @@
       ],
       "id": "thermostat"
     }
-  ]
+  ],
+  "capabilities": {
+    "danfoss_mode": {
+      "type": "string",
+      "title": {
+        "en": "Mode"
+      },
+      "getable": true,
+      "setable": false,
+      "uiComponent": "sensor",
+      "insights": false
+    }
+  }
 }

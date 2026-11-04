@@ -1,6 +1,7 @@
 'use strict';
 
 const Homey = require('homey');
+const DanfossAllyApi = require('../../lib/DanfossAllyApi');
 
 // Mode mapping: Danfoss mode -> setpoint code
 const MODE_SETPOINT_MAP = {
@@ -109,6 +110,13 @@ class IconThermostatBasicDevice extends Homey.Device {
       this.setCapabilityValue('measure_humidity', humidity).catch(this.error);
     }
 
+    // Surface the mode the gateway reports, so it is visible in Homey rather
+    // than only in the logs.
+    if (!this.hasCapability('danfoss_mode')) {
+      await this.addCapability('danfoss_mode').catch(this.error);
+    }
+    this.setCapabilityValue('danfoss_mode', DanfossAllyApi.formatMode(deviceData.mode)).catch(this.error);
+
     // Update battery if available
     if ('battery' in deviceData) {
       this.setCapabilityValue('measure_battery', deviceData.battery).catch(this.error);
@@ -116,7 +124,7 @@ class IconThermostatBasicDevice extends Homey.Device {
       this.setCapabilityValue('measure_battery', deviceData.battery_percentage).catch(this.error);
     }
 
-    this.log(`Updated Icon Thermostat Basic ${this._deviceId}: temp=${deviceData.temperature}, target=${targetTemp} [mode=${deviceData.mode}, temp_set=${deviceData.temp_set}, manual_mode_fast=${deviceData.manual_mode_fast}, at_home_setting=${deviceData.at_home_setting}, holiday_setting=${deviceData.holiday_setting}, work_state=${deviceData.work_state}, SetpointChangeSource=${deviceData.SetpointChangeSource ?? deviceData.setpointchangesource}]`);
+    this.log(`Updated Icon Thermostat Basic ${this._deviceId}: temp=${deviceData.temp_current}, target=${targetTemp} [mode=${deviceData.mode}, temp_set=${deviceData.temp_set}, manual_mode_fast=${deviceData.manual_mode_fast}, at_home_setting=${deviceData.at_home_setting}, holiday_setting=${deviceData.holiday_setting}, work_state=${deviceData.work_state}, SetpointChangeSource=${deviceData.SetpointChangeSource ?? deviceData.setpointchangesource}]`);
   }
 
   /**
@@ -129,13 +137,6 @@ class IconThermostatBasicDevice extends Homey.Device {
    */
   _getSetpointForCurrentMode(deviceData) {
     const setpointCode = this._resolveSetpointCode(deviceData);
-
-    // manual_mode_fast is not readable as a setpoint: the gateway rewrites it
-    // to upper_temp (35) while the room is calling for heat. temp_set holds
-    // the manual setpoint, so read that instead when it is reported.
-    if (setpointCode === 'manual_mode_fast' && 'temp_set' in deviceData) {
-      return deviceData.temp_set;
-    }
 
     if (setpointCode in deviceData) {
       return deviceData[setpointCode];

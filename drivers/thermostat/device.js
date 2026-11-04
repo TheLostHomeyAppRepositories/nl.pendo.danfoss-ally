@@ -1,6 +1,7 @@
 'use strict';
 
 const Homey = require('homey');
+const DanfossAllyApi = require('../../lib/DanfossAllyApi');
 
 // Mode mapping: Danfoss mode -> setpoint code
 const MODE_SETPOINT_MAP = {
@@ -112,6 +113,13 @@ class ThermostatDevice extends Homey.Device {
       }
       this.setCapabilityValue('measure_humidity', deviceData.humidity).catch(this.error);
     }
+
+    // Surface the mode the gateway reports, so it is visible in Homey rather
+    // than only in the logs.
+    if (!this.hasCapability('danfoss_mode')) {
+      await this.addCapability('danfoss_mode').catch(this.error);
+    }
+    this.setCapabilityValue('danfoss_mode', DanfossAllyApi.formatMode(deviceData.mode)).catch(this.error);
 
     // Update measure_battery
     if ('battery_percentage' in deviceData) {
