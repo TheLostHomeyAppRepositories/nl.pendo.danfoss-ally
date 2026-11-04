@@ -567,14 +567,53 @@
   ],
   "capabilities": {
     "danfoss_mode": {
-      "type": "string",
+      "type": "enum",
       "title": {
         "en": "Mode"
       },
+      "icon": "/assets/capability/danfoss_mode.svg",
       "getable": true,
-      "setable": false,
-      "uiComponent": "sensor",
-      "insights": false
+      "setable": true,
+      "uiComponent": "picker",
+      "insights": false,
+      "values": [
+        {
+          "id": "at_home",
+          "title": {
+            "en": "At home"
+          }
+        },
+        {
+          "id": "leaving_home",
+          "title": {
+            "en": "Leaving home"
+          }
+        },
+        {
+          "id": "holiday",
+          "title": {
+            "en": "Holiday (Away)"
+          }
+        },
+        {
+          "id": "holiday_sat",
+          "title": {
+            "en": "Holiday (Home)"
+          }
+        },
+        {
+          "id": "pause",
+          "title": {
+            "en": "Pause"
+          }
+        },
+        {
+          "id": "manual",
+          "title": {
+            "en": "Manual"
+          }
+        }
+      ]
     }
   }
 }

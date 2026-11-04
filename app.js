@@ -6,6 +6,16 @@ const DanfossAllyApi = require('./lib/DanfossAllyApi');
 const DEFAULT_POLL_INTERVAL = 45; // seconds
 const MIN_POLL_INTERVAL = 10; // seconds
 const MAX_POLL_INTERVAL = 300; // seconds
+const FALLBACK_RETRY_AFTER = 60; // seconds, when the API does not say
+
+// The bulk /ally/devices list is a stale projection: it lags minutes behind on
+// setpoints, mode and availability. It is only reliable for discovery, so it
+// runs rarely. Live state comes from /ally/devices/{id} per thermostat.
+const BULK_REFRESH_INTERVAL = 600; // seconds
+const PER_DEVICE_CONCURRENCY = 5;
+// Danfoss throttles on sustained volume, so hold the per-device rate down by
+// stretching the refresh when a home has many thermostats.
+const MIN_SECONDS_PER_THERMOSTAT = 10;
 
 class DanfossAllyApp extends Homey.App {
 
@@ -19,6 +29,9 @@ class DanfossAllyApp extends Homey.App {
     this._pollInterval = null;
     this._lastWriteTime = 0;
     this._lastPollTime = 0;
+    this._rateLimitedUntil = 0;
+    this._lastBulkTime = 0;
+    this._bulkTimer = null;
 
     // Try to initialize with stored credentials
     const apiKey = this.homey.settings.get('api_key');
@@ -131,18 +144,109 @@ class DanfossAllyApp extends Homey.App {
    * Start the polling interval
    */
   _startPolling() {
-    // Clear existing interval if any
-    if (this._pollInterval) {
-      this.homey.clearInterval(this._pollInterval);
-    }
+    this._stopPolling();
 
-    const interval = this._getPollInterval();
+    const interval = this._getRefreshInterval();
 
     this._pollInterval = this.homey.setInterval(async () => {
-      await this.pollDevices();
+      await this.refreshThermostats();
     }, interval);
 
-    this.log(`Started polling every ${interval / 1000} seconds`);
+    this._bulkTimer = this.homey.setInterval(async () => {
+      await this.pollDevices();
+    }, BULK_REFRESH_INTERVAL * 1000);
+
+    this.log(`Refreshing thermostats every ${interval / 1000}s, full device list every ${BULK_REFRESH_INTERVAL}s`);
+  }
+
+  /**
+   * How often to refresh thermostats, in milliseconds.
+   *
+   * The configured interval is honoured unless the number of thermostats would
+   * push the request rate into Danfoss's throttling, in which case it is
+   * stretched. Each thermostat costs one request per refresh.
+   * @returns {number}
+   */
+  _getRefreshInterval() {
+    const configured = this._getPollInterval();
+    const thermostats = this._getThermostatIds().length;
+    const floor = thermostats * MIN_SECONDS_PER_THERMOSTAT * 1000;
+    return Math.max(configured, floor);
+  }
+
+  /**
+   * Ids of every cached device that is a thermostat.
+   * @returns {string[]}
+   */
+  _getThermostatIds() {
+    const devices = (this.api && this.api.devices) || {};
+    return Object.keys(devices).filter((id) => devices[id] && devices[id].isThermostat);
+  }
+
+  /**
+   * Refresh live state for every thermostat from its own endpoint.
+   *
+   * The bulk list cannot be used for this: it is routinely minutes behind on
+   * the setpoint and the mode, and since the mode selects which setpoint field
+   * to read, a stale mode yields the wrong field rather than merely an old
+   * number.
+   */
+  async refreshThermostats() {
+    if (Date.now() < this._rateLimitedUntil) {
+      return;
+    }
+
+    const ids = this._getThermostatIds();
+    if (ids.length === 0) {
+      return;
+    }
+
+    const timeSinceWrite = Date.now() - this._lastWriteTime;
+    if (timeSinceWrite < 1000) {
+      await new Promise((resolve) => this.homey.setTimeout(resolve, 1000));
+    }
+
+    const queue = [...ids];
+    let rateLimited = null;
+    let refreshed = 0;
+
+    const worker = async () => {
+      while (queue.length > 0) {
+        const id = queue.shift();
+        try {
+          await this.api.getDevice(id);
+          refreshed++;
+        } catch (err) {
+          if (err.code === 'RATE_LIMITED') {
+            rateLimited = err;
+            queue.length = 0;
+            return;
+          }
+          this.error(`Failed to refresh ${id}:`, err.message);
+        }
+      }
+    };
+
+    const workers = [];
+    for (let i = 0; i < Math.min(PER_DEVICE_CONCURRENCY, ids.length); i++) {
+      workers.push(worker());
+    }
+    await Promise.all(workers);
+
+    if (rateLimited) {
+      // Wait exactly as long as the API asked. Any longer is a penalty of our
+      // own invention and starves every device of fresh data for no reason.
+      const retryAfter = rateLimited.retryAfter > 0 ? rateLimited.retryAfter : FALLBACK_RETRY_AFTER;
+      this._rateLimitedUntil = Date.now() + (retryAfter * 1000);
+      this.error(`Rate limited while refreshing thermostats. Pausing for ${retryAfter}s.`);
+    }
+
+    this._lastPollTime = Date.now();
+    this.homey.emit('danfoss_ally_update', this.api.devices);
+
+    if (refreshed > 0) {
+      this.log(`Refreshed ${refreshed} thermostat(s)`);
+    }
   }
 
   /**
@@ -152,14 +256,28 @@ class DanfossAllyApp extends Homey.App {
     if (this._pollInterval) {
       this.homey.clearInterval(this._pollInterval);
       this._pollInterval = null;
-      this.log('Stopped polling');
+    }
+    if (this._bulkTimer) {
+      this.homey.clearInterval(this._bulkTimer);
+      this._bulkTimer = null;
     }
   }
 
   /**
-   * Poll devices from the API
+   * Fetch the full device list.
+   *
+   * This is discovery: names, models, which devices exist and which are
+   * thermostats. Its setpoints and modes are not trustworthy, so drivers get
+   * their live values from refreshThermostats instead.
    */
   async pollDevices() {
+    // The Danfoss API rejects polls for a while once it has rate limited us.
+    // Polling through that window keeps the penalty alive and starves every
+    // device of fresh data, so sit it out instead.
+    if (Date.now() < this._rateLimitedUntil) {
+      return;
+    }
+
     // Postpone poll if a recent write was made (avoid UI glitches)
     const timeSinceWrite = Date.now() - this._lastWriteTime;
     if (timeSinceWrite < 1000) {
@@ -169,15 +287,18 @@ class DanfossAllyApp extends Homey.App {
 
     try {
       const devices = await this.api.getDeviceList();
+      this._lastBulkTime = Date.now();
       this._lastPollTime = Date.now();
 
       // Emit event for all drivers to update their devices
       this.homey.emit('danfoss_ally_update', devices);
 
-      this.log(`Polled ${Object.keys(devices).length} devices`);
+      this.log(`Fetched device list: ${Object.keys(devices).length} devices`);
     } catch (err) {
       if (err.code === 'RATE_LIMITED') {
-        this.error(`Rate limited by Danfoss API. Consider increasing the poll interval (currently ${this._getPollInterval() / 1000}s). Retry after ${err.retryAfter}s.`);
+        const retryAfter = err.retryAfter > 0 ? err.retryAfter : FALLBACK_RETRY_AFTER;
+        this._rateLimitedUntil = Date.now() + (retryAfter * 1000);
+        this.error(`Rate limited by Danfoss API. Pausing polls for ${retryAfter}s. Consider increasing the poll interval (currently ${this._getPollInterval() / 1000}s).`);
       } else {
         this.error('Failed to poll devices:', err.message);
       }

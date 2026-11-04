@@ -1,7 +1,6 @@
 'use strict';
 
 const Homey = require('homey');
-const DanfossAllyApi = require('../../lib/DanfossAllyApi');
 
 // Mode mapping: Danfoss mode -> setpoint code
 const MODE_SETPOINT_MAP = {
@@ -12,6 +11,9 @@ const MODE_SETPOINT_MAP = {
   holiday: 'holiday_setting',
   holiday_sat: 'at_home_setting',
 };
+
+// Modes the mode picker offers, matching .homeycompose/capabilities/danfoss_mode.json
+const SELECTABLE_MODES = ['at_home', 'leaving_home', 'holiday', 'holiday_sat', 'pause', 'manual'];
 
 class IconThermostatBasicDevice extends Homey.Device {
 
@@ -25,9 +27,15 @@ class IconThermostatBasicDevice extends Homey.Device {
     this._deviceId = this.getData().id;
     this._fallbackToTempSet = false;
 
+    await this._migrateModeCapability();
+
     // Register capability listeners
     this.registerCapabilityListener('target_temperature', async (value) => {
       await this._setTargetTemperature(value);
+    });
+
+    this.registerCapabilityListener('danfoss_mode', async (value) => {
+      await this.homey.app.setMode(this._deviceId, value);
     });
 
     // Listen for updates from the app
@@ -37,6 +45,32 @@ class IconThermostatBasicDevice extends Homey.Device {
 
     // Initial sync
     this._syncFromApi();
+  }
+
+  /**
+   * Recreate the mode capability on devices that predate the picker.
+   *
+   * Homey copies a capability's definition onto the device when it is added,
+   * so a device that gained this one while it was a read-only text row keeps
+   * that definition and a label as its value. The picker cannot match either,
+   * so remove and re-add it once to pick up the current definition.
+   */
+  async _migrateModeCapability() {
+    if (!this.hasCapability('danfoss_mode')) {
+      return;
+    }
+    if (this.getStoreValue('mode_capability_rev')) {
+      return;
+    }
+
+    try {
+      await this.removeCapability('danfoss_mode');
+      await this.addCapability('danfoss_mode');
+      await this.setStoreValue('mode_capability_rev', true);
+      this.log('Recreated the mode capability as a picker');
+    } catch (err) {
+      this.error('Failed to migrate the mode capability:', err.message);
+    }
   }
 
   /**
@@ -65,13 +99,17 @@ class IconThermostatBasicDevice extends Homey.Device {
    * Update capabilities from device data
    */
   async _updateCapabilities(deviceData) {
-    // Check if device is online
+    // Availability and values are independent. A payload flagged offline
+    // still carries valid setpoints, and the flag itself comes from a
+    // source that lags, so discarding the data freezes the tile on stale
+    // values for a device that is usually working.
     if (deviceData.online === false) {
       this.setUnavailable('Device is offline').catch(this.error);
-      return;
+    } else {
+      this.setAvailable().catch(this.error);
     }
 
-    this.setAvailable().catch(this.error);
+    await this._syncTemperatureRange(deviceData);
 
     // Determine if we need to use fallback temp_set
     this._fallbackToTempSet = !(
@@ -115,7 +153,13 @@ class IconThermostatBasicDevice extends Homey.Device {
     if (!this.hasCapability('danfoss_mode')) {
       await this.addCapability('danfoss_mode').catch(this.error);
     }
-    this.setCapabilityValue('danfoss_mode', DanfossAllyApi.formatMode(deviceData.mode)).catch(this.error);
+    // Only the modes the picker defines may be written: an enum rejects
+    // anything else. An unrecognised mode keeps the previous value.
+    if (SELECTABLE_MODES.includes(deviceData.mode)) {
+      this.setCapabilityValue('danfoss_mode', deviceData.mode).catch(this.error);
+    } else if ('mode' in deviceData) {
+      this.log(`Ignoring unknown mode from the API: ${deviceData.mode}`);
+    }
 
     // Update battery if available
     if ('battery' in deviceData) {
@@ -124,7 +168,50 @@ class IconThermostatBasicDevice extends Homey.Device {
       this.setCapabilityValue('measure_battery', deviceData.battery_percentage).catch(this.error);
     }
 
-    this.log(`Updated Icon Thermostat Basic ${this._deviceId}: temp=${deviceData.temp_current}, target=${targetTemp} [mode=${deviceData.mode}, temp_set=${deviceData.temp_set}, manual_mode_fast=${deviceData.manual_mode_fast}, at_home_setting=${deviceData.at_home_setting}, holiday_setting=${deviceData.holiday_setting}, work_state=${deviceData.work_state}, SetpointChangeSource=${deviceData.SetpointChangeSource ?? deviceData.setpointchangesource}]`);
+    this.log(`Updated Icon Thermostat Basic ${this._deviceId}: temp=${deviceData.temp_current / 10}, target=${targetTemp} [mode=${deviceData.mode}, temp_set=${deviceData.temp_set}, manual_mode_fast=${deviceData.manual_mode_fast}, at_home_setting=${deviceData.at_home_setting}, holiday_setting=${deviceData.holiday_setting}, work_state=${deviceData.work_state}, SetpointChangeSource=${deviceData.SetpointChangeSource ?? deviceData.setpointchangesource}]`);
+  }
+
+  /**
+   * Mirror the device's own temperature limits onto the capability.
+   *
+   * The range is configured per room in the Ally app, so one hardcoded range
+   * is wrong for most systems: Homey would offer values the device refuses,
+   * and the tile would snap back as though we had lost the write. Writing
+   * capability options is expensive, so only write when a limit changed.
+   * @param {object} deviceData - Device data from the API
+   */
+  async _syncTemperatureRange(deviceData) {
+    const hasLower = typeof deviceData.lower_temp === 'number';
+    const hasUpper = typeof deviceData.upper_temp === 'number';
+    if (!hasLower && !hasUpper) {
+      return;
+    }
+
+    let current;
+    try {
+      current = this.getCapabilityOptions('target_temperature') || {};
+    } catch (err) {
+      return;
+    }
+
+    const next = { ...current };
+    if (hasLower) {
+      next.min = deviceData.lower_temp / 10;
+    }
+    if (hasUpper) {
+      next.max = deviceData.upper_temp / 10;
+    }
+
+    if (next.min === current.min && next.max === current.max) {
+      return;
+    }
+
+    try {
+      await this.setCapabilityOptions('target_temperature', next);
+      this.log(`Temperature range now ${next.min}-${next.max}`);
+    } catch (err) {
+      this.error('Failed to set temperature range:', err.message);
+    }
   }
 
   /**
@@ -161,17 +248,28 @@ class IconThermostatBasicDevice extends Homey.Device {
    * Resolve which setpoint code currently holds the active setpoint.
    */
   _resolveSetpointCode(deviceData) {
-    // A setpoint changed at the thermostat itself wins over the mode preset:
-    // the room runs that value even though the gateway still reports the house
-    // mode. Both spellings of the key occur in the wild.
-    const changeSource = deviceData.SetpointChangeSource ?? deviceData.setpointchangesource;
-    if (changeSource === 'Manual') {
+    if (this._isManualOverride(deviceData)) {
       return 'manual_mode_fast';
     }
 
     return 'mode' in deviceData
       ? this._getSetpointCode(deviceData.mode)
       : 'manual_mode_fast';
+  }
+
+  /**
+   * Whether the setpoint was last changed at the thermostat itself.
+   *
+   * A manual change there wins over the mode preset: the device runs that
+   * value even while the gateway still reports a house mode. Danfoss is
+   * inconsistent about both the key's capitalisation and the value's, so
+   * compare case-insensitively.
+   * @param {object} deviceData - Device data from the API
+   * @returns {boolean}
+   */
+  _isManualOverride(deviceData) {
+    const source = deviceData.SetpointChangeSource ?? deviceData.setpointchangesource;
+    return typeof source === 'string' && source.toLowerCase() === 'manual';
   }
 
   /**
